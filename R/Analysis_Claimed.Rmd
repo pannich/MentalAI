@@ -1,0 +1,391 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-02-25"
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+
+library(bit64)
+library(data.table)
+library(ggplot2)
+library(knitr)
+
+data_folder    = "/Users/nichada/MyCode/MPCS/Job/_Interview/CBH"
+```
+
+```{r}
+# Load the CSV file using read.csv()
+shift_offers <- fread(file = paste0(data_folder, "/Shift Offers v3.csv"), stringsAsFactors = FALSE)
+
+```
+
+## Observe why some shift offers are not claimed
+
+-   As a product team, I want to analyse how we can make our calim rate to be 100%. This will improve our users : workers and workplaces satisfactions, as well as drive revenue.
+
+### Data cleaning & claimed column
+
+```{r}
+# Clean the canceled and deleted shifts
+# create claimed column
+shift_offers <- shift_offers[is.na(CANCELED_AT) & is.na(DELETED_AT)]
+shift_offers[, c("CANCELED_AT", "DELETED_AT") := NULL]
+shift_offers[, CLAIMED := ifelse(is.na(CLAIMED_AT), 0, 1)]
+
+# Check the first few rows of unclaimed shifts
+head(shift_offers)
+```
+
+### Claimed shifts
+
+```{r}
+# Filter for claimed shifts (where claimed_at is not NA)
+claimed_shifts <- shift_offers[CLAIMED == 1]
+  
+# Optionally, if you want to exclude shifts that were later canceled or deleted:
+unclaimed_shifts <- shift_offers[CLAIMED == 0]
+
+# View the first few rows of claimed shifts
+head(claimed_shifts)
+```
+
+-   Create a new variable Lead time hours
+
+```{r}
+# Create a new variable for lead time (in hours) between posting and shift start
+shift_offers[, SHIFT_CREATED_AT := as.POSIXct(SHIFT_CREATED_AT)]
+shift_offers[, SHIFT_START_AT := as.POSIXct(SHIFT_START_AT)]
+shift_offers[, LEAD_TIME_HOUR := as.numeric(difftime(SHIFT_START_AT, SHIFT_CREATED_AT, units = "hours"))]
+```
+
+## Export csv to visualize
+
+```{r}
+# Export unclaimed shifts to a CSV file
+fwrite(unclaimed_shifts, file = paste0(data_folder, "/unclaimed_shifts.csv"))
+
+# Export claimed shifts to a CSV file
+fwrite(claimed_shifts, file = paste0(data_folder, "/claimed_shifts.csv"))
+```
+
+## Analyze why unclaimed
+
+summary - The unclaimed case is much greater than the claimed by more than 10x.
+
+```{r}
+cat("unclaimed counts: ", nrow(unclaimed_shifts), "\n")
+cat("claimed counts: ", nrow(claimed_shifts))
+```
+
+```{r}
+# Example: Compare shift slots
+contingency_table <- table(shift_offers$CLAIMED, shift_offers$SLOT)
+print(contingency_table)
+
+# Example: Compare pay rates using boxplots
+boxplot(unclaimed_shifts$PAY_RATE, claimed_shifts$PAY_RATE, 
+        names = c("Unclaimed", "Claimed"), 
+        main = "Pay Rate Comparison", ylab = "Hourly Rate")
+```
+
+### The Bad Workplace
+
+### Method 1: Unclaimed Rate Method
+
+-   What It Does: It calculates the raw percentage of unclaimed shifts per workplace by simply dividing the count of unclaimed shifts by the total shifts.
+
+Strengths: - Straightforward and easy to understand.
+- Directly shows the proportion of unclaimed shifts without any modeling assumptions.
+
+Limitations: - Doesn’t account for variability in the number of shifts between workplaces.
+- Doesn’t provide a statistical test for whether differences are due to chance.
+
+```{r}
+# Convert workplace_id to a factor, then to integer
+shift_offers[, WORKPLACE_IDX := as.integer(as.factor(WORKPLACE_ID))]
+shift_offers[, WORKPLACE_IDX := factor(WORKPLACE_IDX)]
+```
+
+```{r}
+workplace_map <- unique(shift_offers[, .(WORKPLACE_IDX, WORKPLACE_ID)])
+```
+
+```{r}
+# Group by workplace_id and calculate total shifts and unclaimed shifts per workplace
+workplace_stats <- shift_offers[, .(
+  total_shifts = .N,
+  unclaimed_count = sum(CLAIMED == 0),
+  claimed_count = sum(CLAIMED == 1)
+), by = WORKPLACE_IDX]
+
+# Calculate the unclaimed rate per workplace
+workplace_stats[, unclaimed_rate := unclaimed_count / total_shifts]
+
+# Order the results by the highest unclaimed rate
+setorder(workplace_stats, -unclaimed_rate)
+
+# View the results
+print(workplace_stats)
+```
+
+```{r, fig.width=8, fig.height=20}
+ggplot(workplace_stats, aes(x = reorder(WORKPLACE_IDX, unclaimed_rate), y = unclaimed_rate)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Unclaimed Shift Rate by Workplace", x = "Workplace", y = "Unclaimed Shift Rate")
+```
+
+### Method 2: Logistic Regression Method
+
+-   What It Does: It models the probability of a shift being claimed (or unclaimed) for each workplace while testing if the differences are statistically significant.
+
+-   How It Works: The regression estimates coefficients (in log-odds) for each workplace compared to a reference category.
+    A negative and significant coefficient for a workplace means that, controlling for other factors (if any are included), shifts at that workplace are less likely to be claimed.
+    The model provides p-values and confidence intervals, allowing you to assess which workplaces differ from the baseline in a statistically robust way.
+
+-   Strengths: Provides formal statistical testing (p-values) to determine if a workplace’s unclaimed rate is significantly different from the reference.
+    Can be expanded to include additional variables (like shift timing or pay rate) to control for confounding factors.
+
+-   Limitations: If only workplace ID is included, it might largely reflect the raw differences; however, it still accounts for sample size variability and provides significance testing.
+    The choice of reference category and dummy coding can influence interpretation.
+
+```{r}
+# Create a binary variable: 1 = Claimed, 0 = Unclaimed
+# Run a logistic regression with workplace_id as a predictor.
+# Note: This will create dummy variables for each workplace_id.
+model <- glm(CLAIMED ~ WORKPLACE_IDX, data = shift_offers, family = binomial)
+```
+
+```{r}
+model_summary <- summary(model)
+
+# Convert the coefficients matrix into a data frame
+coefs <- as.data.frame(model_summary$coefficients)
+
+# Name the columns for clarity
+# Typically, the columns are: Estimate, Std. Error, z value, and Pr(>|z|)
+colnames(coefs) <- c("Estimate", "Std.Error", "z.value", "p.value")
+
+# Create a column for the term names (row names)
+coefs$Term <- rownames(coefs)
+
+# (Optional) If you want to exclude the intercept from the sorting:
+coefs <- coefs[coefs$Term != "(Intercept)", ]
+
+# Sort by p-value in ascending order (lowest p-value = most significant)
+coefs_sorted <- coefs[order(coefs$Estimate), ]
+coefs_significant <- coefs_sorted[coefs_sorted$p.value < 0.05, ]
+```
+
+### Investigate the worst workplaces
+
+Investigate the worst workplaces: The most negative, statistically significant workplaces (p \< 0.05) are likely causing unclaimed shifts.
+Explore factors like pay rates, shift timing, or worker reviews at these locations.
+
+```{r}
+problematic_workplaces <- setDT(coefs_significant[coefs_significant$Estimate < 0, ])
+
+setnames(problematic_workplaces, "Term", "WORKPLACE_IDX")
+problematic_workplaces[, WORKPLACE_IDX := sub("^WORKPLACE_IDX", "", WORKPLACE_IDX)]
+
+problematic_workplaces <- merge(
+  problematic_workplaces,
+  workplace_map,
+  by = "WORKPLACE_IDX",   # common column
+  all.x = TRUE            # left join; keep all rows from 'problematic_workplaces'
+)
+
+problematic_workplaces <- problematic_workplaces[, .(WORKPLACE_IDX, WORKPLACE_ID)]
+
+kable(data.frame(problematic_workplaces), caption = "Problematic Workplaces - Coeficient < 0 ")
+```
+
+```{r}
+# mark problematic workplace in the shift_offers data set
+shift_offers[, problematic := factor(ifelse(WORKPLACE_IDX %in% problematic_workplaces$WORKPLACE_IDX, 1, 0))]
+```
+
+```{r}
+# Compare pay_rate between the two groups
+ggplot(shift_offers, aes(x = problematic, y = PAY_RATE, fill = problematic)) +
+  geom_boxplot() +
+  labs(
+    title = "Pay Rate by Group",
+    x = "Problematic Workplace",
+    y = "Pay Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Reshape (melt) multiple numeric columns
+library(reshape2)  # or data.table::melt if you prefer
+melted_data <- melt(
+  data = shift_offers,
+  id.vars = "problematic", 
+  measure.vars = c("DURATION", "LEAD_TIME_HOUR")  # add more columns if needed
+)
+
+# Create boxplots for each variable in a facet
+ggplot(melted_data, aes(x = problematic, y = value, fill = problematic)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    title = "Comparison of Key Metrics by Group",
+    x = "Problematic",
+    y = "Value"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Compute summary statistics for each group
+shift_offers[, .(
+  count = .N,
+  mean = mean(LEAD_TIME_HOUR, na.rm = TRUE),
+  median = median(LEAD_TIME_HOUR, na.rm = TRUE),
+  sd = sd(LEAD_TIME_HOUR, na.rm = TRUE),
+  min = min(LEAD_TIME_HOUR, na.rm = TRUE),
+  max = max(LEAD_TIME_HOUR, na.rm = TRUE),
+  q25 = quantile(LEAD_TIME_HOUR, 0.25, na.rm = TRUE),
+  q75 = quantile(LEAD_TIME_HOUR, 0.75, na.rm = TRUE)
+), by = problematic]
+```
+
+```{r}
+ggplot(shift_offers, aes(x = PAY_RATE, fill = problematic)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Pay Rate Distribution",
+    x = "Pay Rate",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(shift_offers, aes(x = LEAD_TIME_HOUR, fill = problematic)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Lead Time Hour Distribution",
+    x = "Pay Rate",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(shift_offers, aes(x = factor(problematic), fill = SLOT)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Slot Distribution by Group",
+    x = "Slot",
+    fill = "Problematic (0 = Non-Problematic, 1 = Problematic)"
+  ) +
+  theme_minimal()
+```
+
+Problematic vs Non-Problematic workplace characteristics : 1.
+There is not a significant impact in Pay rate 2.
+There is not a significant impact in Duration 3..
+Problematic workplace has shorter lead time than the non-problematic ones.
+- Comparing median 22.63 for non-problematic and 16.07 for problematic.
+- Problematic workplaces have narrower interquartile range.
+Q25 to Q75 for Problematic = 4.89 to 76.00 (range \~71).
+Q25 to Q75 for Non-Problematic = 7.05 to 193.87 (range \~186).
+- Negative Lead Time : Non-Problematic min = -870.93 hours (suggesting potential data errors or shifts posted after they started).
+Could indicate shifts that were backfilled.
+4.
+Problematic workplace has more PM than AM slots than the non-problematic ones.
+However the data doesn't show a significant sign.
+5.
+There could be a problem with the workplace name itself that is not desirable.
+
+\newpage
+
+## Clean data2
+
+Colinearity
+
+```{r}
+unique(shift_offers$CHARGE_RATE)
+var(shift_offers$CHARGE_RATE, na.rm = TRUE)
+var(shift_offers$PAY_RATE, na.rm = TRUE)
+cor(shift_offers$CHARGE_RATE, shift_offers$PAY_RATE, use = "complete.obs")
+```
+
+## Expand Models
+
+-   Explore other factors that are contributing to the unclaimed offers
+-   Use log regression
+
+```{r}
+model_full <- glm(CLAIMED ~ WORKPLACE_ID + PAY_RATE + DURATION + SLOT + LEAD_TIME_HOUR, 
+                  data = shift_offers, family = binomial)
+summary(model_full)
+```
+
+-   Separate lines for PAY_RATE, CHARGE_RATE, DURATION, etc. Each of these has its own coefficient and p-value, indicating how they affect the odds of a shift being claimed after controlling for workplace and other variables.
+-   Note include CHARGE_RATE due because it may not be a factor of consideration for worker.
+
+model_full \<- glm(CLAIMED \~ WORKPLACE_ID + PAY_RATE + CHARGE_RATE + DURATION + SLOT + LEAD_TIME_HOUR, data = shift_offers, family = binomial)
+
+### Find Cut-out points
+
+```{r}
+# Create a new data table spanning the range of rate values
+new_data <- data.table(
+  PAY_RATE = seq(min(shift_offers$PAY_RATE), max(shift_offers$PAY_RATE), length.out = 100),
+  DURATION = median(shift_offers$DURATION),
+  SLOT = factor("am", levels = unique(shift_offers$SLOT)),  # Ensure it matches existing levels
+  LEAD_TIME_HOUR = median(shift_offers$LEAD_TIME_HOUR, na.rm = TRUE),
+  WORKPLACE_ID = factor("64316d145665f001ba8ff5f9", levels = unique(shift_offers$WORKPLACE_ID))
+)
+
+# Compute the predicted probabilities using the expanded model
+pred_probs <- predict(model_full, newdata = new_data, type = "response")
+
+# Plot predicted probability vs. rate
+plot(new_data$PAY_RATE, pred_probs, type = "l", xlab = "Pay Rate", ylab = "Predicted Probability of Being Claimed", ylim = c(0, 1))
+abline(h = 0.5, col = "red", lty = 2)  # a reference line for 50% probability
+
+```
+
+```{r}
+# Create a new data table spanning the range of rate values
+new_data <- data.table(
+  LEAD_TIME_HOUR = seq(min(shift_offers$LEAD_TIME_HOUR), max(shift_offers$LEAD_TIME_HOUR), length.out = 100),
+  PAY_RATE = median(shift_offers$PAY_RATE, na.rm = TRUE),
+  DURATION = median(shift_offers$DURATION),
+  SLOT = factor("am", levels = unique(shift_offers$SLOT)),  # Ensure it matches existing levels
+  WORKPLACE_ID = factor("64316d145665f001ba8ff5f9", levels = unique(shift_offers$WORKPLACE_ID))
+)
+
+# Compute the predicted probabilities using the expanded model
+pred_probs <- predict(model_full, newdata = new_data, type = "response")
+
+# Plot predicted probability vs. rate
+plot(new_data$LEAD_TIME_HOUR, pred_probs, type = "l", xlab = "LEAD_TIME_HOUR", ylab = "Predicted Probability of Being Claimed", ylim = c(0, 1))
+abline(h = 0.5, col = "red", lty = 2)  # a reference line for 50% probability
+
+```
+
+## Conclusion
+
+-   The analysis indicates that workplace is a key factor driving unclaimed shift offers.
+-   I further investigated other potential reasons why certain workplaces are less desirable, including pay rate, shift duration, time slot, and lead time.
+-   Shorter lead times appear to contribute to the issue, particularly in problematic workplaces. However, since some non-problematic workplaces also have short lead times, this factor alone is not necessarily a deal-breaker. Instead, maintaining a reasonable lead time is likely beneficial but not the sole determinant of shift claims.
+-   The most concerning finding is that some workplaces have an extremely high unclaimed rate (\>90%), as evidenced in workplace_stats. This suggests a need for further investigation into the work environment at these **locations**, including **workplace conditions**, **location**, and **type of work**.
+-   Understanding these factors will help us determine why these workplaces struggle to get shifts claimed and identify potential interventions to improve their claim rates.
+
+## Recommendation to the Product Team
+
+### Short Term Actions
+
+### Long Term Strategy
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
